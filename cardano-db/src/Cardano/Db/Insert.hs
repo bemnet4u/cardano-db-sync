@@ -41,6 +41,7 @@ module Cardano.Db.Insert
   , insertTxMetadata
   , insertTxOut
   , insertWithdrawal
+  , insertManyUncheckedUnique
 
   -- Export mainly for testing.
   , insertBlockChecked
@@ -62,7 +63,7 @@ import qualified Data.Text as Text
 import           Database.Persist.Class (AtLeastOneUniqueKey, PersistEntityBackend, insert,
                    insertBy, replaceUnique)
 import           Database.Persist.Sql (OnlyOneUniqueKey, PersistRecordBackend, SqlBackend,
-                   UniqueDef, entityDB, entityDef, entityUniques, rawSql, toPersistFields,
+                   UniqueDef, entityDB, entityDef, entityUniques, rawExecute, rawSql, toPersistFields,
                    toPersistValue, uniqueDBName)
 import qualified Database.Persist.Sql.Util as Util
 import           Database.Persist.Types (ConstraintNameDB (..), EntityNameDB (..), FieldNameDB (..),
@@ -203,6 +204,41 @@ data DbInsertException
   deriving Show
 
 instance Exception DbInsertException
+
+insertManyUncheckedUnique
+    :: forall m record.
+        ( MonadBaseControl IO m
+        , MonadIO m
+        , OnlyOneUniqueKey record
+        )
+    => String -> [record] -> ReaderT SqlBackend m ()
+insertManyUncheckedUnique vtype records = do
+    handle exceptHandler (rawExecute query values)
+  where
+    query :: Text
+    query =
+      Text.concat
+        [ "INSERT INTO "
+        , unEntityNameDB (entityDB . entityDef $ records)
+        , " (", Util.commaSeparated fieldNames
+        , ") VALUES "
+        ,  Util.commaSeparated . replicate (length records)
+             . Util.parenWrapped . Util.commaSeparated $ placeholders
+        , " ON CONFLICT ON CONSTRAINT "
+        , unConstraintNameDB (uniqueDBName $ onlyOneUniqueDef (Proxy @record))
+        , " DO NOTHING"
+        ]
+
+    values :: [PersistValue]
+    values = concatMap (map toPersistValue . toPersistFields) records
+
+    fieldNames, placeholders :: [Text]
+    (fieldNames, placeholders) =
+      unzip (Util.mkInsertPlaceholders (entityDef (Proxy @record)) escapeFieldName)
+
+    exceptHandler :: SqlError -> ReaderT SqlBackend m a
+    exceptHandler e =
+      liftIO $ throwIO (DbInsertException vtype e)
 
 -- Insert, getting PostgreSQL to check the uniqueness constaint, and if it is violated, rewrite
 -- the first field with the same value to force PostgresSQL to return the row identifier.
