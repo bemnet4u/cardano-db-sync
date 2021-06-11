@@ -53,7 +53,7 @@ services:
     volumes:
       - db-sync-data:/var/lib/cdbsync
       # - node-ipc:/node-ipc
-      - /home/ubuntu/dev/cardano-node/mainnet_relay/db:/node-ipc
+      - /home/ubuntu/dev/cardano-node/mainnet_relay3/db:/node-ipc
     restart: always
     logging:
       driver: "json-file"
