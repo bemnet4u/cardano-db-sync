@@ -38,7 +38,7 @@ services:
   #       max-file: "10"
 
   cardano-db-sync:
-    image: inputoutput/cardano-db-sync:9.0.0
+    image: inputoutput/cardano-db-sync:10.0.1
     environment:
       - NETWORK=${NETWORK:-mainnet}
       - POSTGRES_HOST=postgres
@@ -60,6 +60,10 @@ services:
       options:
         max-size: "200k"
         max-file: "10"
+    # Limit memory to 1-2 gb. and max of 1 core cpu
+    mem_limit: 8G
+    mem_reservation: 1G
+    cpus: 0.5
 
 secrets:
   postgres_db:
