@@ -17,6 +17,13 @@ services:
     ports:
       - 5432:5432
     restart: always
+    # Limit memory 
+    mem_limit: 500M
+    mem_reservation: 100M
+    memswap_limit: 2G
+    mem_swappiness: 75
+    cpus: 0.25
+
     logging:
       driver: "json-file"
       options:
@@ -37,33 +44,35 @@ services:
   #       max-size: "200k"
   #       max-file: "10"
 
-  cardano-db-sync:
-    image: inputoutput/cardano-db-sync:10.0.1
-    environment:
-      - NETWORK=${NETWORK:-mainnet}
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-    depends_on:
-      # - cardano-node
-      - postgres
-    secrets:
-      - postgres_password
-      - postgres_user
-      - postgres_db
-    volumes:
-      - db-sync-data:/var/lib/cdbsync
-      # - node-ipc:/node-ipc
-      - /home/ubuntu/dev/cardano-node/mainnet_relay3/db:/node-ipc
-    restart: always
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "200k"
-        max-file: "10"
-    # Limit memory to 1-2 gb. and max of 1 core cpu
-    mem_limit: 8G
-    mem_reservation: 1G
-    cpus: 0.5
+  # cardano-db-sync:
+  #   image: inputoutput/cardano-db-sync:10.0.1
+  #   environment:
+  #     - NETWORK=${NETWORK:-mainnet}
+  #     - POSTGRES_HOST=postgres
+  #     - POSTGRES_PORT=5432
+  #   depends_on:
+  #     # - cardano-node
+  #     - postgres
+  #   secrets:
+  #     - postgres_password
+  #     - postgres_user
+  #     - postgres_db
+  #   volumes:
+  #     - db-sync-data:/var/lib/cdbsync
+  #     # - node-ipc:/node-ipc
+  #     - /home/ubuntu/dev/cardano-node/mainnet_relay3/db:/node-ipc
+  #   restart: always
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "200k"
+  #       max-file: "10"
+  #   # Limit memory 
+  #   mem_limit: 4G
+  #   mem_reservation: 1G
+  #   memswap_limit: 12G
+  #   # mem_swappiness: 40
+  #   cpus: 0.5
 
 secrets:
   postgres_db:
