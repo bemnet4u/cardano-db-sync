@@ -14,12 +14,15 @@ module Cardano.DbSync.Era.Shelley.Query
 
   , queryStakeAddressIdPair
   , queryPoolHashIdPair
+  , queryPoolUpdateByBlock
   ) where
 
 import           Cardano.Prelude hiding (from, maybeToEither, on)
 
 import           Cardano.Db
 import qualified Cardano.DbSync.Era.Shelley.Generic as Generic
+
+import qualified Cardano.Ledger.Keys as Ledger
 
 import qualified Cardano.Sync.Era.Shelley.Generic as Generic
 import           Cardano.Sync.Util
@@ -34,7 +37,6 @@ import           Ouroboros.Consensus.Cardano.Block (StandardCrypto)
 
 import qualified Shelley.Spec.Ledger.Address as Shelley
 import           Shelley.Spec.Ledger.Credential (Ptr (..), StakeReference (..))
-import qualified Shelley.Spec.Ledger.Keys as Shelley
 
 
 queryPoolHashId :: MonadIO m => ByteString -> ReaderT SqlBackend m (Maybe PoolHashId)
@@ -92,7 +94,7 @@ queryStakeAddressAndPool epoch addr = do
 
 queryStakePoolKeyHash
     :: forall era m. MonadIO m
-    => Shelley.KeyHash 'Shelley.StakePool era
+    => Ledger.KeyHash 'Ledger.StakePool era
     -> ReaderT SqlBackend m (Either LookupFail PoolHashId)
 queryStakePoolKeyHash kh = do
   res <- select . from $ \ (poolUpdate `InnerJoin` poolHash `InnerJoin` tx `InnerJoin` blk) -> do
@@ -155,13 +157,26 @@ queryStakeAddressIdPair cred@(Generic.StakeCred bs) = do
     convert :: Value StakeAddressId -> (Generic.StakeCred, StakeAddressId)
     convert (Value said) = (cred, said)
 
-queryPoolHashIdPair :: MonadIO m => Shelley.KeyHash 'Shelley.StakePool StandardCrypto -> ReaderT SqlBackend m (Maybe (Shelley.KeyHash 'Shelley.StakePool StandardCrypto, PoolHashId))
+queryPoolHashIdPair
+    :: MonadIO m
+    => Ledger.KeyHash 'Ledger.StakePool StandardCrypto
+    -> ReaderT SqlBackend m (Maybe (Ledger.KeyHash 'Ledger.StakePool StandardCrypto, PoolHashId))
 queryPoolHashIdPair pkh = do
     res <- select . from $ \ pool -> do
               where_ (pool ^. PoolHashHashRaw ==. val (Generic.unKeyHashRaw pkh))
               pure $ pool ^. PoolHashId
     pure $ convert <$> listToMaybe res
   where
-    convert :: Value PoolHashId -> (Shelley.KeyHash 'Shelley.StakePool StandardCrypto, PoolHashId)
+    convert :: Value PoolHashId -> (Ledger.KeyHash 'Ledger.StakePool StandardCrypto, PoolHashId)
     convert (Value phid) = (pkh, phid)
 
+-- Check if there are other PoolUpdates in the same blocks for the same pool
+queryPoolUpdateByBlock :: MonadIO m => BlockId -> PoolHashId -> ReaderT SqlBackend m Bool
+queryPoolUpdateByBlock blkId poolHashId = do
+    res <- select . from $ \ (poolUpdate `InnerJoin` tx `InnerJoin` blk) -> do
+              on (blk ^. BlockId ==. tx ^. TxBlockId)
+              on (tx ^. TxId ==. poolUpdate ^. PoolUpdateRegisteredTxId)
+              where_ (poolUpdate ^. PoolUpdateHashId ==. val poolHashId)
+              where_ (blk ^. BlockId ==. val blkId)
+              pure (blk ^. BlockEpochNo)
+    pure $ not (null res)

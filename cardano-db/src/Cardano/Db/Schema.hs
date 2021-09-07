@@ -19,7 +19,7 @@ module Cardano.Db.Schema where
 
 import           Cardano.Db.Schema.Orphans ()
 
-import           Cardano.Db.Types (DbInt65, DbLovelace, DbWord64)
+import           Cardano.Db.Types (DbInt65, DbLovelace, DbWord64, SyncState)
 
 import           Data.ByteString.Char8 (ByteString)
 import           Data.Int (Int64)
@@ -30,6 +30,7 @@ import           Data.Word (Word16, Word64)
 
 -- Do not use explicit imports from this module as the imports can change
 -- from version to version due to changes to the TH code in Persistent.
+import           Database.Persist.Class (Unique)
 import           Database.Persist.TH
 
 -- In the schema definition we need to match Haskell types with with the
@@ -103,6 +104,8 @@ share
 
     invalidBefore       DbWord64 Maybe      sqltype=word64type
     invalidHereafter    DbWord64 Maybe      sqltype=word64type
+
+    validContract       Bool                                    -- False if the contract is invalid, True otherwise.
     UniqueTx            hash
     deriving Show
 
@@ -127,6 +130,12 @@ share
     txOutId             TxId                OnDeleteCascade     -- The transaction where this was created as an output.
     txOutIndex          Word16              sqltype=txindex
     UniqueTxin          txOutId txOutIndex
+
+  CollateralTxIn
+    txInId              TxId                OnDeleteCascade     -- The transaction where this is used as an input.
+    txOutId             TxId                OnDeleteCascade     -- The transaction where this was created as an output.
+    txOutIndex          Word16              sqltype=txindex
+    UniqueColTxin       txOutId txOutIndex
 
   -- A table containing metadata about the chain. There will probably only ever be one
   -- row in this table.
@@ -179,11 +188,12 @@ share
   -- -----------------------------------------------------------------------------------------------
   -- A Pool can have more than one owner, so we have a PoolOwner table that references this one.
 
-  PoolMetaData
+  PoolMetadataRef
+    poolId              PoolHashId
     url                 Text
     hash                ByteString          sqltype=hash32type
     registeredTxId      TxId                OnDeleteCascade     -- Only used for rollback.
-    UniquePoolMetaData  url hash
+    UniquePoolMetadataRef poolId hash
 
   PoolUpdate
     hashId              PoolHashId          OnDeleteCascade
@@ -192,7 +202,7 @@ share
     pledge              DbLovelace          sqltype=lovelace
     rewardAddr          ByteString          sqltype=addr29type
     activeEpochNo       Word64
-    metaId              PoolMetaDataId Maybe OnDeleteCascade
+    metaId              PoolMetadataRefId Maybe OnDeleteCascade
     margin              Double                                  -- sqltype=percentage????
     fixedCost           DbLovelace          sqltype=lovelace
     registeredTxId      TxId                OnDeleteCascade     -- Slot number in which the pool was registered.
@@ -281,7 +291,7 @@ share
     amount              DbLovelace          sqltype=lovelace
     epochNo             Word64
     poolId              PoolHashId          OnDeleteCascade
-    UniqueReward        addrId epochNo
+    UniqueReward        epochNo addrId poolId
 
   -- Orphaned rewards happen when a stake address earns rewards, but the stake address is
   -- deregistered before the rewards are distributed.
@@ -292,7 +302,7 @@ share
     amount              DbLovelace          sqltype=lovelace
     epochNo             Word64
     poolId              PoolHashId          OnDeleteCascade
-    UniqueOrphaned      addrId epochNo
+    UniqueOrphaned      epochNo addrId poolId
 
   -- This table should never get rolled back.
   EpochStake
@@ -300,7 +310,7 @@ share
     poolId              PoolHashId          OnDeleteCascade
     amount              DbLovelace          sqltype=lovelace
     epochNo             Word64
-    UniqueStake         addrId epochNo
+    UniqueStake         epochNo addrId poolId
 
   Treasury
     addrId              StakeAddressId      OnDeleteCascade
@@ -339,15 +349,15 @@ share
   ParamProposal
     epochNo             Word64              sqltype=uinteger
     key                 ByteString          sqltype=hash28type
-    minFeeA             Word64 Maybe        sqltype=uinteger
-    minFeeB             Word64 Maybe        sqltype=uinteger
-    maxBlockSize        Word64 Maybe        sqltype=uinteger
-    maxTxSize           Word64 Maybe        sqltype=uinteger
-    maxBhSize           Word64 Maybe        sqltype=uinteger
+    minFeeA             Word64 Maybe        sqltype=word64type
+    minFeeB             Word64 Maybe        sqltype=word64type
+    maxBlockSize        Word64 Maybe        sqltype=word64type
+    maxTxSize           Word64 Maybe        sqltype=word64type
+    maxBhSize           Word64 Maybe        sqltype=word64type
     keyDeposit          DbLovelace Maybe    sqltype=lovelace
     poolDeposit         DbLovelace Maybe    sqltype=lovelace
-    maxEpoch            Word64 Maybe        sqltype=uinteger
-    optimalPoolCount    Word64 Maybe        sqltype=uinteger
+    maxEpoch            Word64 Maybe        sqltype=word64type
+    optimalPoolCount    Word64 Maybe        sqltype=word64type
     influence           Double Maybe        -- sqltype=rational
     monetaryExpandRate  Double Maybe        -- sqltype=interval
     treasuryGrowthRate  Double Maybe        -- sqltype=interval
@@ -357,6 +367,18 @@ share
     protocolMinor       Word16 Maybe        sqltype=uinteger
     minUtxoValue        DbLovelace Maybe    sqltype=lovelace
     minPoolCost         DbLovelace Maybe    sqltype=lovelace
+
+    adaPerUTxOWord      DbLovelace Maybe    sqltype=lovelace
+    costModels          Text Maybe
+    priceMem            DbLovelace Maybe    sqltype=lovelace
+    priceStep           DbLovelace Maybe    sqltype=lovelace
+    maxTxExMem          DbWord64 Maybe      sqltype=word64type
+    maxTxExSteps        DbWord64 Maybe      sqltype=word64type
+    maxBlockExMem       DbWord64 Maybe      sqltype=word64type
+    maxBlockExSteps     DbWord64 Maybe      sqltype=word64type
+    maxValSize          DbWord64 Maybe      sqltype=word64type
+    collateralPercent   Word16 Maybe        sqltype=uinteger
+    maxCollateralInputs Word16 Maybe        sqltype=uinteger
 
     registeredTxId      TxId                OnDeleteCascade    -- Slot number in which update registered.
     UniqueParamProposal key registeredTxId
@@ -388,52 +410,45 @@ share
     UniqueEpochParam    epochNo blockId
 
   -- -----------------------------------------------------------------------------------------------
-  -- SMASH related tables.
-  -- The table containing pools' on-chain reference to its off-chain metadata.
+  -- Pool offline (ie not on the blockchain) data.
 
-  PoolMetadataRef
-    poolId              PoolHashId
-    url                 Text
-    hash                ByteString          sqltype=hash32type
-    UniquePoolMetadataRef poolId hash
-
-  -- The table containing the metadata.
-
-  PoolMetadata
-    poolId              PoolHashId
+  PoolOfflineData
+    poolId              PoolHashId          OnDeleteCascade
     tickerName          Text
     hash                ByteString          sqltype=hash32type
     metadata            Text
-    pmrId               PoolMetadataRefId Maybe
-    UniquePoolMetadata  poolId hash
+    pmrId               PoolMetadataRefId   OnDeleteCascade
+    UniquePoolOfflineData  poolId hash
+    deriving Show
 
   -- The pool metadata fetch error. We duplicate the poolId for easy access.
   -- TODO(KS): Debatable whether we need to persist this between migrations!
 
-  PoolMetadataFetchError
+  PoolOfflineFetchError
+    poolId              PoolHashId          OnDeleteCascade
     fetchTime           UTCTime             sqltype=timestamp
-    poolId              PoolHashId
-    pmrId               PoolMetadataRefId
+    pmrId               PoolMetadataRefId   OnDeleteCascade
     fetchError          Text
     retryCount          Word                sqltype=uinteger
-    UniquePoolMetadataFetchError fetchTime poolId retryCount
+    UniquePoolOfflineFetchError poolId fetchTime retryCount
+    deriving Show
+
+  EpochSyncTime
+    no                  Word64
+    seconds             Double Maybe
+    state               SyncState           sqltype=syncstatetype
+    UniqueEpochSyncTime no
 
   --------------------------------------------------------------------------
   -- Tables below must be preserved when migrations occur!
   --------------------------------------------------------------------------
 
-  -- A table containing a list of delisted pools. Pools which should not be
-  -- provided over the SMASH web service.
-  DelistedPool
-    poolId              PoolHashId
-    UniqueDelistedPool poolId
-
   -- A table containing a managed list of reserved ticker names.
   -- For now they are grouped under the specific hash of the pool.
-  ReservedTicker
+  ReservedPoolTicker
     name                Text
     poolId              PoolHashId
-    UniqueReservedTicker name
+    UniqueReservedPoolTicker name
     deriving Show
 
   -- A table containin a list of administrator users that can be used to access the secure API endpoints.
@@ -445,3 +460,5 @@ share
     deriving Show
 
   |]
+
+deriving instance Eq (Unique EpochSyncTime)

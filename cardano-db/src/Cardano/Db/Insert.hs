@@ -7,11 +7,14 @@
 
 module Cardano.Db.Insert
   ( insertAdaPots
+  , insertAdminUser
   , insertBlock
+  , insertCollateralTxIn
   , insertDelegation
   , insertEpoch
   , insertEpochParam
   , insertEpochStake
+  , insertEpochSyncTime
   , insertMaTxMint
   , insertMaTxOut
   , insertMeta
@@ -19,12 +22,15 @@ module Cardano.Db.Insert
   , insertParamProposal
   , insertPotTransfer
   , insertPoolHash
-  , insertPoolMetaData
+  , insertPoolMetadataRef
+  , insertPoolOfflineData
+  , insertPoolOfflineFetchError
   , insertPoolOwner
   , insertPoolRelay
   , insertPoolRetire
   , insertPoolUpdate
   , insertReserve
+  , insertReservedPoolTicker
   , insertReward
   , insertSlotLeader
   , insertStakeAddress
@@ -54,13 +60,14 @@ import           Data.Proxy (Proxy (..))
 import           Data.Text (Text)
 import qualified Data.Text as Text
 
-import           Database.Persist.Class (AtLeastOneUniqueKey, PersistEntityBackend, insert)
+import           Database.Persist.Class (AtLeastOneUniqueKey, PersistEntityBackend, insert,
+                   insertBy, replaceUnique)
 import           Database.Persist.Sql (OnlyOneUniqueKey, PersistRecordBackend, SqlBackend,
                    UniqueDef, entityDB, entityDef, entityUniques, rawSql, toPersistFields,
                    toPersistValue, uniqueDBName)
 import qualified Database.Persist.Sql.Util as Util
 import           Database.Persist.Types (ConstraintNameDB (..), EntityNameDB (..), FieldNameDB (..),
-                   PersistValue)
+                   PersistValue, entityKey)
 import           Database.PostgreSQL.Simple (SqlError)
 
 import           Cardano.Db.Schema
@@ -82,11 +89,20 @@ import           Cardano.Db.Schema
 -- Instead we use `insertUnchecked` for tables where uniqueness constraints are unlikley to be hit
 -- and `insertChecked` for tables where the uniqueness constraint might can be hit.
 
+insertAdaPots :: (MonadBaseControl IO m, MonadIO m) => AdaPots -> ReaderT SqlBackend m AdaPotsId
+insertAdaPots = insertCheckUnique "AdaPots"
+
+insertAdminUser :: (MonadBaseControl IO m, MonadIO m) => AdminUser -> ReaderT SqlBackend m AdminUserId
+insertAdminUser = insertUnchecked "AdminUser"
+
 insertBlock :: (MonadBaseControl IO m, MonadIO m) => Block -> ReaderT SqlBackend m BlockId
 insertBlock = insertUnchecked "Block"
 
 insertBlockChecked :: (MonadBaseControl IO m, MonadIO m) => Block -> ReaderT SqlBackend m BlockId
 insertBlockChecked = insertCheckUnique "Block"
+
+insertCollateralTxIn :: (MonadBaseControl IO m, MonadIO m) => CollateralTxIn -> ReaderT SqlBackend m CollateralTxInId
+insertCollateralTxIn = insertUnchecked "CollateralTxIn"
 
 insertDelegation :: (MonadBaseControl IO m, MonadIO m) => Delegation -> ReaderT SqlBackend m DelegationId
 insertDelegation = insertCheckUnique "Delegation"
@@ -99,6 +115,9 @@ insertEpochParam = insertUnchecked "EpochParam"
 
 insertEpochStake :: (MonadBaseControl IO m, MonadIO m) => EpochStake -> ReaderT SqlBackend m EpochStakeId
 insertEpochStake = insertUnchecked "EpochStake"
+
+insertEpochSyncTime :: (MonadBaseControl IO m, MonadIO m) => EpochSyncTime -> ReaderT SqlBackend m EpochSyncTimeId
+insertEpochSyncTime = insertReplace "EpochSyncTime"
 
 insertMaTxMint :: (MonadBaseControl IO m, MonadIO m) => MaTxMint -> ReaderT SqlBackend m MaTxMintId
 insertMaTxMint = insertCheckUnique "insertMaTxMint"
@@ -121,8 +140,14 @@ insertPotTransfer = insertUnchecked "PotTransfer"
 insertPoolHash :: (MonadBaseControl IO m, MonadIO m) => PoolHash -> ReaderT SqlBackend m PoolHashId
 insertPoolHash = insertCheckUnique "PoolHash"
 
-insertPoolMetaData :: (MonadBaseControl IO m, MonadIO m) => PoolMetaData -> ReaderT SqlBackend m PoolMetaDataId
-insertPoolMetaData = insertCheckUnique "PoolMetaData"
+insertPoolMetadataRef :: (MonadBaseControl IO m, MonadIO m) => PoolMetadataRef -> ReaderT SqlBackend m PoolMetadataRefId
+insertPoolMetadataRef = insertCheckUnique "PoolMetadataRef"
+
+insertPoolOfflineData :: (MonadBaseControl IO m, MonadIO m) => PoolOfflineData -> ReaderT SqlBackend m PoolOfflineDataId
+insertPoolOfflineData = insertCheckUnique "PoolOfflineData"
+
+insertPoolOfflineFetchError :: (MonadBaseControl IO m, MonadIO m) => PoolOfflineFetchError -> ReaderT SqlBackend m PoolOfflineFetchErrorId
+insertPoolOfflineFetchError = insertCheckUnique "PoolOfflineFetchError"
 
 insertPoolOwner :: (MonadBaseControl IO m, MonadIO m) => PoolOwner -> ReaderT SqlBackend m PoolOwnerId
 insertPoolOwner = insertCheckUnique "PoolOwner"
@@ -138,6 +163,9 @@ insertPoolUpdate = insertCheckUnique "PoolUpdate"
 
 insertReserve :: (MonadBaseControl IO m, MonadIO m) => Reserve -> ReaderT SqlBackend m ReserveId
 insertReserve = insertUnchecked "Reserve"
+
+insertReservedPoolTicker :: (MonadBaseControl IO m, MonadIO m) => ReservedPoolTicker -> ReaderT SqlBackend m ReservedPoolTickerId
+insertReservedPoolTicker = insertUnchecked "ReservedPoolTicker"
 
 insertReward :: (MonadBaseControl IO m, MonadIO m) => Reward -> ReaderT SqlBackend m RewardId
 insertReward = insertUnchecked "Reward"
@@ -172,9 +200,6 @@ insertTxOut = insertUnchecked "TxOut"
 insertWithdrawal :: (MonadBaseControl IO m, MonadIO m) => Withdrawal  -> ReaderT SqlBackend m WithdrawalId
 insertWithdrawal = insertUnchecked "Withdrawal"
 
-insertAdaPots :: (MonadBaseControl IO m, MonadIO m) => AdaPots -> ReaderT SqlBackend m AdaPotsId
-insertAdaPots = insertCheckUnique "AdaPots"
-
 -- -----------------------------------------------------------------------------
 
 data DbInsertException
@@ -182,23 +207,6 @@ data DbInsertException
   deriving Show
 
 instance Exception DbInsertException
-
--- Insert without checking uniqueness constraints. This should be safe for most tables
--- even tables with uniqueness constraints, especially block, tx and many others, where
--- uniqueness is enforced by the ledger.
-insertUnchecked
-    :: ( AtLeastOneUniqueKey record
-       , MonadIO m
-       , MonadBaseControl IO m
-       , PersistEntityBackend record ~ SqlBackend
-       )
-    => String -> record -> ReaderT SqlBackend m (Key record)
-insertUnchecked vtype =
-    handle exceptHandler . insert
-  where
-    exceptHandler :: MonadIO m => SqlError -> ReaderT SqlBackend m a
-    exceptHandler e =
-      liftIO $ throwIO (DbInsertException vtype e)
 
 -- Insert, getting PostgreSQL to check the uniqueness constaint, and if it is violated, rewrite
 -- the first field with the same value to force PostgresSQL to return the row identifier.
@@ -246,6 +254,46 @@ insertCheckUnique vtype record = do
     exceptHandler :: SqlError -> ReaderT SqlBackend m a
     exceptHandler e =
       liftIO $ throwIO (DbInsertException vtype e)
+
+insertReplace
+    :: forall m record.
+        ( AtLeastOneUniqueKey record
+        , Eq (Unique record)
+        , MonadBaseControl IO m
+        , MonadIO m
+        , PersistRecordBackend record SqlBackend
+        )
+    => String -> record -> ReaderT SqlBackend m (Key record)
+insertReplace vtype record =
+    handle exceptHandler $ do
+      eres <- insertBy record
+      case eres of
+        Right rid -> pure rid
+        Left rec -> do
+          mres <- replaceUnique (entityKey rec) record
+          maybe (pure $ entityKey rec) (const . pure $ entityKey rec) mres
+  where
+    exceptHandler :: SqlError -> ReaderT SqlBackend m a
+    exceptHandler e =
+      liftIO $ throwIO (DbInsertException vtype e)
+
+-- Insert without checking uniqueness constraints. This should be safe for most tables
+-- even tables with uniqueness constraints, especially block, tx and many others, where
+-- uniqueness is enforced by the ledger.
+insertUnchecked
+    :: ( AtLeastOneUniqueKey record
+       , MonadIO m
+       , MonadBaseControl IO m
+       , PersistEntityBackend record ~ SqlBackend
+       )
+    => String -> record -> ReaderT SqlBackend m (Key record)
+insertUnchecked vtype =
+    handle exceptHandler . insert
+  where
+    exceptHandler :: MonadIO m => SqlError -> ReaderT SqlBackend m a
+    exceptHandler e =
+      liftIO $ throwIO (DbInsertException vtype e)
+
 
 -- This is cargo culted from Persistent because it is not exported.
 escapeFieldName :: FieldNameDB -> Text

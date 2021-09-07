@@ -24,20 +24,23 @@ import           Cardano.Api.Shelley (TxMetadataValue (..), makeTransactionMetad
 
 import           Cardano.BM.Trace (Trace, logDebug, logInfo, logWarning)
 
-import           Cardano.Db (DbLovelace (..), DbWord64 (..))
 
 import qualified Cardano.Crypto.Hash as Crypto
 
+import           Cardano.Db (DbLovelace (..), DbWord64 (..), SyncState (..))
 import qualified Cardano.Db as DB
 
+import           Cardano.DbSync.Era
 import qualified Cardano.DbSync.Era.Shelley.Generic as Generic
 import           Cardano.DbSync.Era.Shelley.Generic.ParamProposal
 import           Cardano.DbSync.Era.Shelley.Insert.Epoch
 import           Cardano.DbSync.Era.Shelley.Query
 import           Cardano.DbSync.Era.Util (liftLookupFail)
 
+import qualified Cardano.Ledger.BaseTypes as Shelley
 import           Cardano.Ledger.Coin (Coin (..))
 import qualified Cardano.Ledger.Coin as Shelley
+import qualified Cardano.Ledger.Keys as Shelley
 
 import           Cardano.Sync.Error
 import           Cardano.Sync.LedgerState
@@ -57,6 +60,8 @@ import qualified Data.ByteString.Char8 as BS
 import qualified Data.ByteString.Lazy.Char8 as LBS
 import           Data.Group (invert)
 import qualified Data.Map.Strict as Map
+import           Data.Maybe.Strict (strictMaybeToMaybe)
+import qualified Data.Set as Set
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import qualified Data.Text.Encoding.Error as Text
@@ -66,10 +71,7 @@ import           Database.Persist.Sql (SqlBackend)
 import           Ouroboros.Consensus.Cardano.Block (StandardCrypto)
 
 import qualified Shelley.Spec.Ledger.Address as Shelley
-import           Shelley.Spec.Ledger.BaseTypes (strictMaybeToMaybe)
-import qualified Shelley.Spec.Ledger.BaseTypes as Shelley
 import qualified Shelley.Spec.Ledger.Credential as Shelley
-import qualified Shelley.Spec.Ledger.Keys as Shelley
 import qualified Shelley.Spec.Ledger.PParams as Shelley
 import qualified Shelley.Spec.Ledger.TxBody as Shelley
 
@@ -103,7 +105,7 @@ insertShelleyBlock tracer lenv blk lStateSnap details = do
                     , DB.blockOpCert = Just $ Generic.blkOpCert blk
                     }
 
-    zipWithM_ (insertTx tracer (leNetwork lenv) blkId (sdEpochNo details) (Generic.blkSlotNo blk)) [0 .. ] (Generic.blkTxs blk)
+    zipWithM_ (insertTx tracer (leNetwork lenv) lStateSnap blkId (sdEpochNo details) (Generic.blkSlotNo blk)) [0 .. ] (Generic.blkTxs blk)
 
     liftIO $ do
       let epoch = unEpochNo (sdEpochNo details)
@@ -132,6 +134,11 @@ insertShelleyBlock tracer lenv blk lStateSnap details = do
     whenJust (maybeToStrict mbop) $ \ bop ->
       insertEpochInterleaved tracer bop
 
+    when (unBlockNo (Generic.blkBlockNo blk) `mod` offlineModBase == 0) .
+      lift $ do
+        insertOfflineResults tracer (leOfflineResultQueue lenv)
+        loadOfflineWorkQueue tracer (leOfflineWorkQueue lenv)
+
     when (getSyncStatus details == SyncFollowing) $
       -- Serializiing things during syncing can drastically slow down full sync
       -- times (ie 10x or more).
@@ -148,6 +155,12 @@ insertShelleyBlock tracer lenv blk lStateSnap details = do
       case eraName of
         Generic.Shelley -> "insertShelleyBlock"
         other -> mconcat [ "insertShelleyBlock(", textShow other, ")" ]
+
+    offlineModBase :: Word64
+    offlineModBase =
+      case getSyncStatus details of
+        SyncFollowing -> 10
+        SyncLagging -> 2000
 
 -- -----------------------------------------------------------------------------
 
@@ -168,9 +181,9 @@ insertOnNewEpoch tracer blkId slotNo epochNo newEpoch = do
 
 insertTx
     :: (MonadBaseControl IO m, MonadIO m)
-    => Trace IO Text -> Shelley.Network -> DB.BlockId -> EpochNo -> SlotNo -> Word64 -> Generic.Tx
+    => Trace IO Text -> Shelley.Network -> LedgerStateSnapshot -> DB.BlockId -> EpochNo -> SlotNo -> Word64 -> Generic.Tx
     -> ExceptT SyncNodeError (ReaderT SqlBackend m) ()
-insertTx tracer network blkId epochNo slotNo blockIndex tx = do
+insertTx tracer network lStateSnap blkId epochNo slotNo blockIndex tx = do
     let fees = unCoin $ Generic.txFees tx
         outSum = unCoin $ Generic.txOutSum tx
         withdrawalSum = unCoin $ Generic.txWithdrawalSum tx
@@ -187,20 +200,22 @@ insertTx tracer network blkId epochNo slotNo blockIndex tx = do
                 , DB.txSize = Generic.txSize tx
                 , DB.txInvalidBefore = DbWord64 . unSlotNo <$> Generic.txInvalidBefore tx
                 , DB.txInvalidHereafter = DbWord64 . unSlotNo <$> Generic.txInvalidHereafter tx
+                , DB.txValidContract = Generic.txValidContract tx
                 }
 
     -- Insert outputs for a transaction before inputs in case the inputs for this transaction
     -- references the output (not sure this can even happen).
     mapM_ (insertTxOut tracer txId) (Generic.txOutputs tx)
 
-    -- Insert the transaction inputs.
+    -- Insert the transaction inputs and collateral inputs (Alonzo).
     mapM_ (insertTxIn tracer txId) (Generic.txInputs tx)
+    mapM_ (insertCollateralTxIn tracer txId) (Generic.txCollateralInputs tx)
 
     case Generic.txMetadata tx of
       Nothing -> pure ()
       Just md -> insertTxMetadata tracer txId md
 
-    mapM_ (insertCertificate tracer network txId epochNo slotNo) $ Generic.txCertificates tx
+    mapM_ (insertCertificate tracer lStateSnap network blkId txId epochNo slotNo) $ Generic.txCertificates tx
     mapM_ (insertWithdrawals tracer txId) $ Generic.txWithdrawals tx
 
     mapM_ (insertParamProposal tracer txId) $ Generic.txParamProposal tx
@@ -238,14 +253,27 @@ insertTxIn _tracer txInId (Generic.TxIn txId index) = do
               , DB.txInTxOutIndex = fromIntegral index
               }
 
+insertCollateralTxIn
+    :: (MonadBaseControl IO m, MonadIO m)
+    => Trace IO Text -> DB.TxId -> Generic.TxIn
+    -> ExceptT SyncNodeError (ReaderT SqlBackend m) ()
+insertCollateralTxIn _tracer txInId (Generic.TxIn txId index) = do
+  txOutId <- liftLookupFail "insertCollateralTxIn" $ DB.queryTxId txId
+  void . lift . DB.insertCollateralTxIn $
+            DB.CollateralTxIn
+              { DB.collateralTxInTxInId = txInId
+              , DB.collateralTxInTxOutId = txOutId
+              , DB.collateralTxInTxOutIndex = fromIntegral index
+              }
+
 insertCertificate
     :: (MonadBaseControl IO m, MonadIO m)
-    => Trace IO Text -> Shelley.Network -> DB.TxId -> EpochNo -> SlotNo -> Generic.TxCertificate
+    => Trace IO Text -> LedgerStateSnapshot -> Shelley.Network -> DB.BlockId -> DB.TxId -> EpochNo -> SlotNo -> Generic.TxCertificate
     -> ExceptT SyncNodeError (ReaderT SqlBackend m) ()
-insertCertificate tracer network txId epochNo slotNo (Generic.TxCertificate idx cert) =
+insertCertificate tracer lStateSnap network blkId txId epochNo slotNo (Generic.TxCertificate idx cert) =
   case cert of
     Shelley.DCertDeleg deleg -> insertDelegCert tracer network txId idx epochNo slotNo deleg
-    Shelley.DCertPool pool -> insertPoolCert tracer network epochNo txId idx pool
+    Shelley.DCertPool pool -> insertPoolCert tracer lStateSnap network epochNo blkId txId idx pool
     Shelley.DCertMir mir -> insertMirCert tracer network txId idx mir
     Shelley.DCertGenesis _gen -> do
         -- TODO : Low priority
@@ -255,11 +283,11 @@ insertCertificate tracer network txId epochNo slotNo (Generic.TxCertificate idx 
 
 insertPoolCert
     :: (MonadBaseControl IO m, MonadIO m)
-    => Trace IO Text -> Shelley.Network -> EpochNo -> DB.TxId -> Word16 -> Shelley.PoolCert StandardCrypto
+    => Trace IO Text -> LedgerStateSnapshot -> Shelley.Network -> EpochNo -> DB.BlockId -> DB.TxId -> Word16 -> Shelley.PoolCert StandardCrypto
     -> ExceptT SyncNodeError (ReaderT SqlBackend m) ()
-insertPoolCert tracer network epoch txId idx pCert =
+insertPoolCert tracer lStateSnap network epoch blkId txId idx pCert =
   case pCert of
-    Shelley.RegPool pParams -> insertPoolRegister tracer network epoch txId idx pParams
+    Shelley.RegPool pParams -> insertPoolRegister tracer lStateSnap network epoch blkId txId idx pParams
     Shelley.RetirePool keyHash epochNum -> insertPoolRetire txId epochNum idx keyHash
 
 insertDelegCert
@@ -274,44 +302,61 @@ insertDelegCert tracer network txId idx epochNo slotNo dCert =
 
 insertPoolRegister
     :: (MonadBaseControl IO m, MonadIO m)
-    => Trace IO Text -> Shelley.Network -> EpochNo -> DB.TxId -> Word16 -> Shelley.PoolParams StandardCrypto
+    => Trace IO Text -> LedgerStateSnapshot -> Shelley.Network -> EpochNo -> DB.BlockId -> DB.TxId -> Word16 -> Shelley.PoolParams StandardCrypto
     -> ExceptT SyncNodeError (ReaderT SqlBackend m) ()
-insertPoolRegister tracer network (EpochNo epoch) txId idx params = do
-  mdId <- case strictMaybeToMaybe $ Shelley._poolMD params of
-            Just md -> Just <$> insertMetaData txId md
-            Nothing -> pure Nothing
+insertPoolRegister tracer lStateSnap network (EpochNo epoch) blkId txId idx params = do
 
-  when (fromIntegral (Shelley.unCoin $ Shelley._poolPledge params) > maxLovelace) $
-    liftIO . logWarning tracer $
-      mconcat
-        [ "Bad pledge amount: ", textShow (Shelley.unCoin $ Shelley._poolPledge params)
-        , " > maxLovelace."
-        ]
+    when (fromIntegral (Shelley.unCoin $ Shelley._poolPledge params) > maxLovelace) $
+      liftIO . logWarning tracer $
+        mconcat
+          [ "Bad pledge amount: ", textShow (Shelley.unCoin $ Shelley._poolPledge params)
+          , " > maxLovelace."
+          ]
 
-  when (fromIntegral (Shelley.unCoin $ Shelley._poolCost params) > maxLovelace) $
-    liftIO . logWarning tracer $
-      mconcat
-        [ "Bad fixed cost amount: ", textShow (Shelley.unCoin $ Shelley._poolCost params)
-        , " > maxLovelace."
-        ]
+    when (fromIntegral (Shelley.unCoin $ Shelley._poolCost params) > maxLovelace) $
+      liftIO . logWarning tracer $
+        mconcat
+          [ "Bad fixed cost amount: ", textShow (Shelley.unCoin $ Shelley._poolCost params)
+          , " > maxLovelace."
+          ]
 
-  poolHashId <- insertPoolHash (Shelley._poolId params)
-  poolUpdateId <- lift . DB.insertPoolUpdate $
-                    DB.PoolUpdate
-                      { DB.poolUpdateHashId = poolHashId
-                      , DB.poolUpdateCertIndex = idx
-                      , DB.poolUpdateVrfKeyHash = Crypto.hashToBytes (Shelley._poolVrf params)
-                      , DB.poolUpdatePledge = Generic.coinToDbLovelace (Shelley._poolPledge params)
-                      , DB.poolUpdateRewardAddr = Generic.serialiseRewardAcntWithNetwork network (Shelley._poolRAcnt params)
-                      , DB.poolUpdateActiveEpochNo = epoch + 2
-                      , DB.poolUpdateMetaId = mdId
-                      , DB.poolUpdateMargin = realToFrac $ Shelley.intervalValue (Shelley._poolMargin params)
-                      , DB.poolUpdateFixedCost = Generic.coinToDbLovelace (Shelley._poolCost params)
-                      , DB.poolUpdateRegisteredTxId = txId
-                      }
+    poolHashId <- insertPoolHash (Shelley._poolId params)
 
-  mapM_ (insertPoolOwner network poolHashId txId) $ toList (Shelley._poolOwners params)
-  mapM_ (insertPoolRelay poolUpdateId) $ toList (Shelley._poolRelays params)
+    mdId <- case strictMaybeToMaybe $ Shelley._poolMD params of
+              Just md -> Just <$> insertMetaDataRef poolHashId txId md
+              Nothing -> pure Nothing
+
+    epochActivationDelay <- mkEpochActivationDelay poolHashId
+
+    poolUpdateId <- lift . DB.insertPoolUpdate $
+                      DB.PoolUpdate
+                        { DB.poolUpdateHashId = poolHashId
+                        , DB.poolUpdateCertIndex = idx
+                        , DB.poolUpdateVrfKeyHash = Crypto.hashToBytes (Shelley._poolVrf params)
+                        , DB.poolUpdatePledge = Generic.coinToDbLovelace (Shelley._poolPledge params)
+                        , DB.poolUpdateRewardAddr = Generic.serialiseRewardAcntWithNetwork network (Shelley._poolRAcnt params)
+                        , DB.poolUpdateActiveEpochNo = epoch + epochActivationDelay
+                        , DB.poolUpdateMetaId = mdId
+                        , DB.poolUpdateMargin = realToFrac $ Shelley.intervalValue (Shelley._poolMargin params)
+                        , DB.poolUpdateFixedCost = Generic.coinToDbLovelace (Shelley._poolCost params)
+                        , DB.poolUpdateRegisteredTxId = txId
+                        }
+
+    mapM_ (insertPoolOwner network poolHashId txId) $ toList (Shelley._poolOwners params)
+    mapM_ (insertPoolRelay poolUpdateId) $ toList (Shelley._poolRelays params)
+
+  where
+    mkEpochActivationDelay :: MonadIO m => DB.PoolHashId -> ExceptT SyncNodeError (ReaderT SqlBackend m) Word64
+    mkEpochActivationDelay poolHashId =
+      if Set.member (Shelley._poolId params) $ getPoolParams (lssOldState lStateSnap)
+        then pure 3
+        else do
+          -- if the pool is not registered at the end of the previous block, check for
+          -- other registrations at the current block. If this is the first registration
+          -- then it's +2, else it's +3.
+          otherUpdates <- lift $ queryPoolUpdateByBlock blkId poolHashId
+          pure $ if otherUpdates then 3 else 2
+
 
 maxLovelace :: Word64
 maxLovelace = 45000000000000000
@@ -343,16 +388,17 @@ insertPoolRetire txId epochNum idx keyHash = do
       }
 
 
-insertMetaData
+insertMetaDataRef
     :: (MonadBaseControl IO m, MonadIO m)
-    => DB.TxId -> Shelley.PoolMetadata
-    -> ExceptT SyncNodeError (ReaderT SqlBackend m) DB.PoolMetaDataId
-insertMetaData txId md =
-  lift . DB.insertPoolMetaData $
-    DB.PoolMetaData
-      { DB.poolMetaDataUrl = Shelley.urlToText (Shelley._poolMDUrl md)
-      , DB.poolMetaDataHash = Shelley._poolMDHash md
-      , DB.poolMetaDataRegisteredTxId = txId
+    => DB.PoolHashId -> DB.TxId -> Shelley.PoolMetadata
+    -> ExceptT SyncNodeError (ReaderT SqlBackend m) DB.PoolMetadataRefId
+insertMetaDataRef poolId txId md =
+  lift . DB.insertPoolMetadataRef $
+    DB.PoolMetadataRef
+      { DB.poolMetadataRefPoolId = poolId
+      , DB.poolMetadataRefUrl = Shelley.urlToText (Shelley._poolMDUrl md)
+      , DB.poolMetadataRefHash = Shelley._poolMDHash md
+      , DB.poolMetadataRefRegisteredTxId = txId
       }
 
 insertStakeAddress
@@ -527,11 +573,11 @@ insertPoolRelay updateId relay =
       Shelley.SingleHostAddr mPort mIpv4 mIpv6 ->
         DB.PoolRelay -- An IPv4 and/or IPv6 address
           { DB.poolRelayUpdateId = updateId
-          , DB.poolRelayIpv4 = textShow <$> Shelley.strictMaybeToMaybe mIpv4
-          , DB.poolRelayIpv6 = textShow <$> Shelley.strictMaybeToMaybe mIpv6
+          , DB.poolRelayIpv4 = textShow <$> strictMaybeToMaybe mIpv4
+          , DB.poolRelayIpv6 = textShow <$> strictMaybeToMaybe mIpv6
           , DB.poolRelayDnsName = Nothing
           , DB.poolRelayDnsSrvName = Nothing
-          , DB.poolRelayPort = Shelley.portToWord16 <$> Shelley.strictMaybeToMaybe mPort
+          , DB.poolRelayPort = Shelley.portToWord16 <$> strictMaybeToMaybe mPort
           }
       Shelley.SingleHostName mPort name ->
         DB.PoolRelay -- An A or AAAA DNS record
@@ -540,7 +586,7 @@ insertPoolRelay updateId relay =
           , DB.poolRelayIpv6 = Nothing
           , DB.poolRelayDnsName = Just (Shelley.dnsToText name)
           , DB.poolRelayDnsSrvName = Nothing
-          , DB.poolRelayPort = Shelley.portToWord16 <$> Shelley.strictMaybeToMaybe mPort
+          , DB.poolRelayPort = Shelley.portToWord16 <$> strictMaybeToMaybe mPort
           }
       Shelley.MultiHostName name ->
         DB.PoolRelay -- An SRV DNS record
@@ -559,7 +605,9 @@ insertParamProposal
 insertParamProposal _tracer txId pp =
   void . lift . DB.insertParamProposal $
     DB.ParamProposal
-      { DB.paramProposalEpochNo = unEpochNo $ pppEpochNo pp
+      { DB.paramProposalRegisteredTxId = txId
+
+      , DB.paramProposalEpochNo = unEpochNo $ pppEpochNo pp
       , DB.paramProposalKey = pppKey pp
       , DB.paramProposalMinFeeA = fromIntegral <$> pppMinFeeA pp
       , DB.paramProposalMinFeeB = fromIntegral <$> pppMinFeeB pp
@@ -579,7 +627,20 @@ insertParamProposal _tracer txId pp =
       , DB.paramProposalProtocolMinor = fromIntegral . Shelley.pvMinor <$> pppProtocolVersion pp
       , DB.paramProposalMinUtxoValue = Generic.coinToDbLovelace <$> pppMinUtxoValue pp
       , DB.paramProposalMinPoolCost = Generic.coinToDbLovelace <$> pppMinPoolCost pp
-      , DB.paramProposalRegisteredTxId = txId
+
+      -- New for Alonzo
+
+      , DB.paramProposalAdaPerUTxOWord = Generic.coinToDbLovelace <$> pppAdaPerUTxOWord pp
+      , DB.paramProposalCostModels = Generic.renderLanguageCostModel <$> pppCostmdls pp
+      , DB.paramProposalPriceMem = Generic.coinToDbLovelace <$> pppPriceMem pp
+      , DB.paramProposalPriceStep = Generic.coinToDbLovelace <$> pppPriceStep pp
+      , DB.paramProposalMaxTxExMem = DbWord64 <$> pppMaxTxExMem pp
+      , DB.paramProposalMaxTxExSteps = DbWord64 <$> pppMaxTxExSteps pp
+      , DB.paramProposalMaxBlockExMem = DbWord64 <$> pppMaxBlockExMem pp
+      , DB.paramProposalMaxBlockExSteps = DbWord64 <$> pppMaxBlockExSteps pp
+      , DB.paramProposalMaxValSize = DbWord64 . fromIntegral <$> pppMaxValSize pp
+      , DB.paramProposalCollateralPercent = fromIntegral <$> pppCollateralPercentage pp
+      , DB.paramProposalMaxCollateralInputs = fromIntegral <$> pppMaxCollateralInputs pp
       }
 
 insertTxMetadata

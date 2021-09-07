@@ -1,34 +1,41 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE DeriveGeneric #-}
 module Cardano.Sync.Types
   ( BlockDetails (..)
   , CardanoBlock
   , CardanoPoint
   , CardanoProtocol
   , EpochSlot (..)
+  , FetchResult (..)
   , PoolKeyHash
   , SlotDetails (..)
-  , SyncState (..)
   , Block (..)
   , MetricSetters (..)
+  , PoolFetchRetry (..)
+  , Retry (..)
   ) where
 
 import           Cardano.Prelude hiding (Meta)
+
+import qualified Cardano.Ledger.Keys as Ledger
+
+import           Cardano.Db (PoolHashId, PoolMetaHash, PoolMetadataRefId, PoolOfflineData,
+                   PoolOfflineFetchError, PoolUrl)
 
 import           Cardano.Sync.Config.Types (CardanoBlock, CardanoProtocol)
 
 import           Cardano.Slotting.Slot (EpochNo (..), EpochSize (..), SlotNo (..))
 
 import           Data.Time.Clock (UTCTime)
+import           Data.Time.Clock.POSIX (POSIXTime)
 
 import           Ouroboros.Consensus.Cardano.Block (StandardCrypto)
 import           Ouroboros.Network.Block (BlockNo, Point)
 
-import qualified Shelley.Spec.Ledger.Keys as Shelley
-
 
 type CardanoPoint = Point CardanoBlock
 
-type PoolKeyHash = Shelley.KeyHash 'Shelley.StakePool StandardCrypto
+type PoolKeyHash = Ledger.KeyHash 'Ledger.StakePool StandardCrypto
 
 data BlockDetails = BlockDetails
   { bdBlock :: !CardanoBlock
@@ -39,6 +46,11 @@ newtype EpochSlot = EpochSlot
   { unEpochSlot :: Word64
   } deriving (Eq, Show)
 
+data FetchResult
+    = ResultMetadata !PoolOfflineData
+    | ResultError !PoolOfflineFetchError
+    deriving Show
+
 data SlotDetails = SlotDetails
   { sdSlotTime :: !UTCTime
   , sdCurrentTime :: !UTCTime
@@ -46,11 +58,6 @@ data SlotDetails = SlotDetails
   , sdEpochSlot :: !EpochSlot
   , sdEpochSize :: !EpochSize
   } deriving (Eq, Show)
-
-data SyncState
-  = SyncLagging         -- Local tip is lagging the global chain tip.
-  | SyncFollowing       -- Local tip is following global chain tip.
-  deriving (Eq, Show)
 
 -- The hash must be unique!
 data Block = Block
@@ -72,3 +79,17 @@ data MetricSetters = MetricSetters
   , metricsSetDbSlotHeight :: SlotNo -> IO ()
   }
 
+data PoolFetchRetry = PoolFetchRetry
+  { pfrPoolHashId :: !PoolHashId
+  , pfrReferenceId :: !PoolMetadataRefId
+  , pfrPoolUrl :: !PoolUrl
+  , pfrPoolMDHash :: !PoolMetaHash
+  , pfrRetry :: !Retry
+  } deriving (Show)
+
+
+data Retry = Retry
+  { retryFetchTime :: !POSIXTime -- Time last time time
+  , retryRetryTime :: !POSIXTime -- Time to retry
+  , retryCount :: !Word
+  } deriving (Eq, Show, Generic)

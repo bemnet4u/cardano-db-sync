@@ -14,24 +14,31 @@ module Cardano.Sync.LedgerState
   , LedgerEvent (..)
   , LedgerStateSnapshot (..)
   , LedgerStateFile (..)
+  , mkLedgerEnv
   , applyBlock
-  , loadLedgerStateAtPoint
   , saveLedgerStateMaybe
   , listLedgerStateFilesOrdered
-  , hashToAnnotation
   , loadLedgerStateFromFile
-  , mkLedgerEnv
   , findStateFromPoint
+  , findLedgerStateFile
   , loadLedgerAtPoint
+  , hashToAnnotation
   , getHeaderHash
+  , getPoolParams
   ) where
+
+import           Prelude (String)
 
 import           Cardano.Binary (DecoderError)
 import qualified Cardano.Binary as Serialize
 
+import           Cardano.Db (SyncState (..))
 import qualified Cardano.Db as DB
 
+import qualified Cardano.Ledger.BaseTypes as Ledger
 import           Cardano.Ledger.Coin (Coin)
+import           Cardano.Ledger.Era
+import           Cardano.Ledger.Keys (KeyHash (..), KeyRole (..))
 import           Cardano.Ledger.Shelley.Constraints (UsesValue)
 import qualified Cardano.Ledger.Val as Val
 
@@ -59,14 +66,15 @@ import qualified Data.ByteString.Lazy.Char8 as LBS
 import qualified Data.ByteString.Short as BSS
 import qualified Data.List as List
 import qualified Data.Map.Strict as Map
+import qualified Data.Set as Set
 import qualified Data.Strict.Maybe as Strict
 import qualified Data.Text as Text
+import           Data.Time.Clock (UTCTime)
 
 import           Ouroboros.Consensus.Block (CodecConfig, WithOrigin (..), blockHash, blockIsEBB,
                    blockPrevHash, withOrigin)
 import           Ouroboros.Consensus.Block.Abstract (ConvertRawHash (..))
 import           Ouroboros.Consensus.Cardano.Block (LedgerState (..), StandardCrypto)
-
 import           Ouroboros.Consensus.Cardano.CanHardFork ()
 import           Ouroboros.Consensus.Config (TopLevelConfig (..), configCodec, configLedger)
 import qualified Ouroboros.Consensus.HardFork.Combinator as Consensus
@@ -85,7 +93,6 @@ import           Ouroboros.Consensus.Storage.Serialisation (DecodeDisk (..), Enc
 import           Ouroboros.Network.Block (HeaderHash, Point (..))
 import qualified Ouroboros.Network.Point as Point
 
-import qualified Shelley.Spec.Ledger.BaseTypes as Shelley
 import           Shelley.Spec.Ledger.LedgerState (AccountState, EpochState, UTxOState)
 import qualified Shelley.Spec.Ledger.LedgerState as Shelley
 import qualified Shelley.Spec.Ledger.Rewards as Shelley
@@ -120,24 +127,28 @@ data IndexCache = IndexCache
 data LedgerEnv = LedgerEnv
   { leProtocolInfo :: !(Consensus.ProtocolInfo IO CardanoBlock)
   , leDir :: !LedgerStateDir
-  , leNetwork :: !Shelley.Network
+  , leNetwork :: !Ledger.Network
   , leStateVar :: !(StrictTVar IO CardanoLedgerState)
   , leEventState :: !(StrictTVar IO LedgerEventState)
-  -- The following two do not really have anything to do with maintaining ledger
+  -- The following do not really have anything to do with maintaining ledger
   -- state. They are here due to the ongoing headaches around the split between
   -- `cardano-sync` and `cardano-db-sync`.
   , leIndexCache :: !(StrictTVar IO IndexCache)
   , leBulkOpQueue :: !(TBQueue IO BulkOperation)
+  , leOfflineWorkQueue :: !(TBQueue IO PoolFetchRetry)
+  , leOfflineResultQueue :: !(TBQueue IO FetchResult)
+  , leEpochSyncTime :: !(StrictTVar IO (Maybe UTCTime))
   }
 
 data LedgerEvent
-  = LedgerNewEpoch !EpochNo
+  = LedgerNewEpoch !EpochNo !SyncState
   | LedgerRewards !SlotDetails !Generic.Rewards
   | LedgerStakeDist !Generic.StakeDist
   deriving Eq
 
 data LedgerEventState = LedgerEventState
-  { lesEpochNo :: !EpochNo
+  { lesInitialized :: !Bool
+  , lesEpochNo :: !EpochNo
   , lesLastRewardsEpoch :: !EpochNo
   , lesLastStateDistEpoch :: !EpochNo
   }
@@ -152,12 +163,13 @@ newtype CardanoLedgerState = CardanoLedgerState
 data LedgerStateFile = LedgerStateFile
   { lsfSlotNo :: !SlotNo
   , lsfHash :: !ByteString
-  , lsNewEpoch :: !Bool
+  , lsNewEpoch :: !(Maybe EpochNo)
   , lsfFilePath :: !FilePath
   } deriving Show
 
 data LedgerStateSnapshot = LedgerStateSnapshot
   { lssState :: !CardanoLedgerState
+  , lssOldState :: !CardanoLedgerState
   , lssNewEpoch :: !(Strict.Maybe Generic.NewEpoch) -- Only Just for a single block at the epoch boundary
   , lssSlotDetails :: !SlotDetails
   , lssEvents :: ![LedgerEvent]
@@ -165,7 +177,7 @@ data LedgerStateSnapshot = LedgerStateSnapshot
 
 mkLedgerEnv :: Consensus.ProtocolInfo IO CardanoBlock
             -> LedgerStateDir
-            -> Shelley.Network
+            -> Ledger.Network
             -> SlotNo
             -> Bool
             -> IO LedgerEnv
@@ -179,6 +191,9 @@ mkLedgerEnv protocolInfo dir network slot deleteFiles = do
     -- 2.5 days worth of slots. If we try to stick more than this number of
     -- items in the queue, bad things are likely to happen.
     boq <- newTBQueueIO 10800
+    owq <- newTBQueueIO 100
+    orq <- newTBQueueIO 100
+    est <- newTVarIO Nothing
     pure LedgerEnv
       { leProtocolInfo = protocolInfo
       , leDir = dir
@@ -187,12 +202,16 @@ mkLedgerEnv protocolInfo dir network slot deleteFiles = do
       , leEventState = evar
       , leIndexCache = ivar
       , leBulkOpQueue = boq
+      , leOfflineWorkQueue = owq
+      , leOfflineResultQueue  = orq
+      , leEpochSyncTime = est
       }
   where
     initLedgerEventState :: LedgerEventState
     initLedgerEventState =
       LedgerEventState
-        { lesEpochNo = EpochNo 0
+        { lesInitialized = False
+        , lesEpochNo = EpochNo 0
         , lesLastRewardsEpoch = EpochNo 0
         , lesLastStateDistEpoch = EpochNo 0
         }
@@ -219,6 +238,7 @@ applyBlock env blk details =
       events <- generateEvents env oldEventState  details newState
       pure $ LedgerStateSnapshot
                 { lssState = newState
+                , lssOldState = oldState
                 , lssNewEpoch = maybeToStrict $ mkNewEpoch oldState newState
                 , lssSlotDetails = details
                 , lssEvents = events
@@ -250,8 +270,9 @@ generateEvents :: LedgerEnv -> LedgerEventState -> SlotDetails -> CardanoLedgerS
 generateEvents env oldEventState details cls = do
     writeTVar (leEventState env) newEventState
     pure $ catMaybes
-            [ if lesEpochNo oldEventState < currentEpochNo
-                then Just (LedgerNewEpoch currentEpochNo) else Nothing
+            [ if currentEpochNo == 1 + lesEpochNo oldEventState
+                then Just (LedgerNewEpoch currentEpochNo (getSyncStatus details))
+                else Nothing
             , LedgerRewards details <$> rewards
             , LedgerStakeDist <$> stakeDist
             ]
@@ -262,22 +283,29 @@ generateEvents env oldEventState details cls = do
     rewards :: Maybe Generic.Rewards
     rewards =
       -- Want the rewards event to be delivered once only, on a single slot.
-      if lesLastRewardsEpoch oldEventState < currentEpochNo
+      if lesLastRewardsEpoch oldEventState < currentEpochNo && lesInitialized oldEventState
         then Generic.epochRewards (leNetwork env) (sdEpochNo details) (clsState cls)
         else Nothing
 
     stakeDist :: Maybe Generic.StakeDist
     stakeDist =
-      if lesLastStateDistEpoch oldEventState < currentEpochNo
+      if lesLastStateDistEpoch oldEventState < currentEpochNo && lesInitialized oldEventState
         then Generic.epochStakeDist (leNetwork env) (sdEpochNo details) (clsState cls)
         else Nothing
 
     newEventState :: LedgerEventState
     newEventState =
       LedgerEventState
-        { lesEpochNo = currentEpochNo
-        , lesLastRewardsEpoch = if isJust rewards then currentEpochNo else lesLastRewardsEpoch oldEventState
-        , lesLastStateDistEpoch = if isJust stakeDist then currentEpochNo else lesLastStateDistEpoch oldEventState
+        { lesInitialized = True
+        , lesEpochNo = currentEpochNo
+        , lesLastRewardsEpoch =
+            if isJust rewards || not (lesInitialized oldEventState)
+              then currentEpochNo
+              else lesLastRewardsEpoch oldEventState
+        , lesLastStateDistEpoch =
+            if isJust stakeDist || not (lesInitialized oldEventState)
+              then currentEpochNo
+              else lesLastStateDistEpoch oldEventState
         }
 
 -- Delete ledger state files for slots later than the provided SlotNo.
@@ -289,10 +317,10 @@ deleteNewerLedgerStateFiles stateDir slotNo = do
     isNewer :: LedgerStateFile -> Bool
     isNewer lsf = lsfSlotNo lsf > slotNo
 
-saveCurrentLedgerState :: LedgerEnv -> Bool -> IO ()
-saveCurrentLedgerState env isNewEpoch = do
+saveCurrentLedgerState :: LedgerEnv -> Maybe EpochNo -> IO ()
+saveCurrentLedgerState env mEpochNo = do
     ledger <- atomically $ readTVar (leStateVar env)
-    case mkLedgerStateFilename (leDir env) ledger isNewEpoch of
+    case mkLedgerStateFilename (leDir env) ledger mEpochNo of
       Origin -> pure () -- we don't store genesis
       At file -> LBS.writeFile file $
         Serialize.serializeEncoding $
@@ -310,11 +338,11 @@ saveLedgerStateMaybe env snapshot synced = do
   writeLedgerState env ledger
   case (synced, lssNewEpoch snapshot) of
     (_, Strict.Just newEpoch) | not (Generic.neIsEBB newEpoch) ->
-      saveCleanupState True    -- Save ledger states on epoch boundaries, unless they are EBBs
+      saveCleanupState (Just $ Generic.neEpoch newEpoch) -- Save ledger states on epoch boundaries, unless they are EBBs
     (SyncFollowing, Strict.Nothing) ->
-      saveCleanupState False   -- If following, save every state.
+      saveCleanupState Nothing   -- If following, save every state.
     (SyncLagging, Strict.Nothing) | block `mod` 2000 == 0 ->
-      saveCleanupState False   -- Only save state ocassionally.
+      saveCleanupState Nothing   -- Only save state ocassionally.
     _ -> pure ()
   where
     block :: Word64
@@ -323,9 +351,9 @@ saveLedgerStateMaybe env snapshot synced = do
     ledger :: ExtLedgerState CardanoBlock
     ledger = clsState $ lssState snapshot
 
-    saveCleanupState :: Bool -> IO ()
-    saveCleanupState isNewEpoch = do
-      saveCurrentLedgerState env isNewEpoch
+    saveCleanupState :: Maybe EpochNo -> IO ()
+    saveCleanupState mEpochNo = do
+      saveCurrentLedgerState env mEpochNo
       cleanupLedgerStateFiles env $
         fromWithOrigin (SlotNo 0) (ledgerTipSlot $ ledgerState ledger)
 
@@ -341,38 +369,31 @@ findLatestLedgerStateDisk config dir deleteFiles = do
   files <- listLedgerStateFilesOrdered dir
   firstJustM (loadLedgerStateFromFile config deleteFiles) files
 
-
-loadLedgerStateAtPoint :: LedgerEnv -> CardanoPoint -> IO ()
-loadLedgerStateAtPoint env point = do
-  -- Load the state
-  mState <- loadState env point
-  case mState of
-    Right st -> writeLedgerState env (clsState st)
-    Left file -> panic $ "loadLedgerStateAtPoint failed to find required state file: "
-                        <> Text.pack (lsfFilePath file)
-
-mkLedgerStateFilename :: LedgerStateDir -> CardanoLedgerState -> Bool -> WithOrigin FilePath
-mkLedgerStateFilename dir ledger isNewEpoch = lsfFilePath . dbPointToFileName dir isNewEpoch
+mkLedgerStateFilename :: LedgerStateDir -> CardanoLedgerState -> Maybe EpochNo -> WithOrigin FilePath
+mkLedgerStateFilename dir ledger mEpochNo = lsfFilePath . dbPointToFileName dir mEpochNo
     <$> getPoint (ledgerTipPoint (Proxy @CardanoBlock) (ledgerState $ clsState ledger))
 
 hashToAnnotation :: ByteString -> ByteString
 hashToAnnotation = Base16.encode . BS.take 5
 
-mkShortHash :: HeaderHash CardanoBlock -> ByteString
-mkShortHash = hashToAnnotation . toRawHash (Proxy @CardanoBlock)
+mkRawHash :: HeaderHash CardanoBlock -> ByteString
+mkRawHash = toRawHash (Proxy @CardanoBlock)
 
-dbPointToFileName :: LedgerStateDir -> Bool -> Point.Block SlotNo (HeaderHash CardanoBlock) -> LedgerStateFile
-dbPointToFileName (LedgerStateDir stateDir) isNewEpoch (Point.Block slot hash) =
+mkShortHash :: HeaderHash CardanoBlock -> ByteString
+mkShortHash = hashToAnnotation . mkRawHash
+
+dbPointToFileName :: LedgerStateDir -> Maybe EpochNo -> Point.Block SlotNo (HeaderHash CardanoBlock) -> LedgerStateFile
+dbPointToFileName (LedgerStateDir stateDir) mEpochNo (Point.Block slot hash) =
     LedgerStateFile
       { lsfSlotNo = slot
       , lsfHash = shortHash
-      , lsNewEpoch = isNewEpoch
+      , lsNewEpoch = mEpochNo
       , lsfFilePath =
           mconcat
             [ stateDir </> show (unSlotNo slot)
             , "-"
             , BS.unpack shortHash
-            , if isNewEpoch then '-' : Text.unpack epochSuffix else ""
+            , epochSuffix
             , ".lstate"
             ]
       }
@@ -380,30 +401,32 @@ dbPointToFileName (LedgerStateDir stateDir) isNewEpoch (Point.Block slot hash) =
     shortHash :: ByteString
     shortHash = mkShortHash hash
 
+    epochSuffix :: String
+    epochSuffix = case mEpochNo of
+      Nothing -> ""
+      Just epoch -> "-" ++ show (unEpochNo epoch)
+
 parseLedgerStateFileName :: LedgerStateDir -> FilePath -> Maybe LedgerStateFile
 parseLedgerStateFileName (LedgerStateDir stateDir) fp =
     case break (== '-') (dropExtension fp) of
       (slotStr, '-': hashEpoch) -> do
         slot <- readMaybe slotStr
         case break (== '-') hashEpoch of
-          (hash, '-' : suffix) | suffix == Text.unpack epochSuffix -> do
-            Just $ build (BS.pack hash) slot True
-          (hash, []) ->
-            Just $ build (BS.pack hash) slot False
+          (hash, '-' : suffix) | Just epochNo <- readMaybe suffix -> do
+            Just $ build (BS.pack hash) slot (Just epochNo)
+          (hash, "") ->
+            Just $ build (BS.pack hash) slot Nothing
           _otherwise -> Nothing
       _otherwise -> Nothing
   where
-    build :: ByteString -> Word64 -> Bool -> LedgerStateFile
-    build hash slot isNewEpoch =
+    build :: ByteString -> Word64 -> Maybe Word64 -> LedgerStateFile
+    build hash slot mEpochNo =
       LedgerStateFile
         { lsfSlotNo = SlotNo slot
         , lsfHash = hash
-        , lsNewEpoch = isNewEpoch
+        , lsNewEpoch = EpochNo <$> mEpochNo
         , lsfFilePath = stateDir </> fp
         }
-
-epochSuffix :: Text
-epochSuffix = "epoch"
 
 -- | This should be exposed by 'consensus'.
 ledgerTipBlockNo :: ExtLedgerState blk -> WithOrigin BlockNo
@@ -428,30 +451,10 @@ cleanupLedgerStateFiles env slotNo = do
     groupFiles lFile (epochBoundary, regularFile, invalid)
       | lsfSlotNo lFile > slotNo =
         (epochBoundary, regularFile, lsfFilePath lFile : invalid)
-      | lsNewEpoch lFile =
+      | Just _ <- lsNewEpoch lFile =
         (lFile : epochBoundary, regularFile, invalid)
       | otherwise =
         (epochBoundary, lFile : regularFile, invalid)
-
-loadState :: LedgerEnv -> CardanoPoint -> IO (Either LedgerStateFile CardanoLedgerState)
-loadState env point =
-  case getPoint point of
-    -- Genesis can be reproduced from configuration.
-    -- TODO: We can make this a monadic action (reread config from disk) to save some memory.
-    Origin -> pure . Right $ initCardanoLedgerState (leProtocolInfo env)
-    At blk -> do
-      -- First try to parse the file without the "epoch" suffix
-      let file = dbPointToFileName (leDir env) False blk
-      mState <- loadLedgerStateFromFile (topLevelConfig env) False file
-      case mState of
-        Just st -> pure $ Right st
-        Nothing -> do
-          -- Now try with the "epoch" suffix
-          let fileEpoch = dbPointToFileName (leDir env) True blk
-          mStateEpoch <- loadLedgerStateFromFile (topLevelConfig env) False fileEpoch
-          case mStateEpoch of
-            Nothing -> pure $ Left file
-            Just stEpoch -> pure $ Right stEpoch
 
 loadLedgerAtPoint :: LedgerEnv -> CardanoPoint -> Bool -> IO (Either [LedgerStateFile] CardanoLedgerState)
 loadLedgerAtPoint env point delFiles = do
@@ -465,32 +468,27 @@ loadLedgerAtPoint env point delFiles = do
 findStateFromPoint :: LedgerEnv -> CardanoPoint -> Bool -> IO (Either [LedgerStateFile] CardanoLedgerState)
 findStateFromPoint env point delFiles = do
   files <- listLedgerStateFilesOrdered (leDir env)
-  found <- findLedgerStateFileDelete files
     -- Genesis can be reproduced from configuration.
     -- TODO: We can make this a monadic action (reread config from disk) to save some memory.
-  case (getPoint point, found) of
-    (Origin, _) -> do
+  case getPoint point of
+    Origin -> do
+      when delFiles $
+        mapM_ (safeRemoveFile . lsfFilePath) files
       pure . Right $ initCardanoLedgerState (leProtocolInfo env)
-    (_, Right lsf) -> do
-      mState <- loadLedgerStateFromFile (topLevelConfig env) False lsf
-      case mState of
-        Nothing -> do
-          when delFiles $ safeRemoveFile $ lsfFilePath lsf
-          panic $ "findStateFromPoint failed to parse required state file: "
-               <> Text.pack (lsfFilePath lsf)
-        Just st -> pure $ Right st
-    (_, Left lsfs) -> do
-      pure $ Left lsfs
-  where
-    -- | Thin wrapper around 'findLedgerStateFile', which deletes files if the flag is enabled.
-    findLedgerStateFileDelete :: [LedgerStateFile]
-                              -> IO (Either [LedgerStateFile] LedgerStateFile)
-    findLedgerStateFileDelete files = do
-      let (filesToDelete, found) = findLedgerStateFile files point
-      -- TODO log which files we delete
+    At blk -> do
+      let (filesToDelete, found) = findLedgerStateFile files (Point.blockPointSlot blk, mkRawHash $ Point.blockPointHash blk)
       when delFiles $
         mapM_ (safeRemoveFile . lsfFilePath) filesToDelete
-      pure found
+      case found of
+        Right lsf -> do
+          mState <- loadLedgerStateFromFile (topLevelConfig env) False lsf
+          case mState of
+            Nothing -> do
+              when delFiles $ safeRemoveFile $ lsfFilePath lsf
+              panic $ "findStateFromPoint failed to parse required state file: "
+                   <> Text.pack (lsfFilePath lsf)
+            Just st -> pure $ Right st
+        Left lsfs -> pure $ Left lsfs
 
 -- Tries to find a file which matches the given point.
 -- It returns the file if we found one, or a list older files. These can
@@ -498,26 +496,23 @@ findStateFromPoint env point delFiles = do
 -- It will also return a list of files that are newer than the point. These files should
 -- be deleted. Files with same slot, but different hash are considered newer.
 findLedgerStateFile
-    :: [LedgerStateFile] -> CardanoPoint
+    :: [LedgerStateFile] -> (SlotNo, ByteString)
     -> ([LedgerStateFile], Either [LedgerStateFile] LedgerStateFile)
-findLedgerStateFile files point =
-  case getPoint point of
-    Origin -> (files, Left [])
-    At blk ->
+findLedgerStateFile files pointPair =
         go [] files
       where
         go delFiles [] = (delFiles, Left [])
         go delFiles (file : rest) =
-          case comparePointToFile file blk  of
+          case comparePointToFile file pointPair of
             EQ -> (delFiles, Right file) -- found the file we were looking for
             LT -> (delFiles, Left $ file : rest) -- found an older file first
             GT -> go (file : delFiles) rest -- keep looking on older files
 
-comparePointToFile :: LedgerStateFile -> Point.Block SlotNo (HeaderHash CardanoBlock) -> Ordering
-comparePointToFile lsf blk =
-  case compare (lsfSlotNo lsf) (Point.blockPointSlot blk)  of
+comparePointToFile :: LedgerStateFile -> (SlotNo, ByteString) -> Ordering
+comparePointToFile lsf (blSlotNo, blHash) =
+  case compare (lsfSlotNo lsf) blSlotNo of
     EQ ->
-      if mkShortHash (Point.blockPointHash blk) == lsfHash lsf
+      if hashToAnnotation blHash == lsfHash lsf
         then EQ
         else GT
     x -> x
@@ -573,6 +568,23 @@ writeLedgerState env st = atomically $ writeTVar (leStateVar env) (CardanoLedger
 safeRemoveFile :: FilePath -> IO ()
 safeRemoveFile fp = handle (\(_ :: IOException) -> pure ()) $ removeFile fp
 
+getPoolParams :: CardanoLedgerState -> Set.Set (KeyHash 'StakePool StandardCrypto)
+getPoolParams st =
+    case ledgerState $ clsState st of
+      LedgerStateByron _ -> Set.empty
+      LedgerStateShelley sts -> getPoolParamsShelley sts
+      LedgerStateAllegra sts -> getPoolParamsShelley sts
+      LedgerStateMary sts -> getPoolParamsShelley sts
+      LedgerStateAlonzo ats -> getPoolParamsShelley ats
+
+getPoolParamsShelley
+    :: forall era. (Crypto era ~ StandardCrypto)
+    => LedgerState (ShelleyBlock era)
+    -> Set.Set (KeyHash 'StakePool StandardCrypto)
+getPoolParamsShelley lState =
+  Map.keysSet $ Shelley._pParams $ Shelley._pstate $ Shelley._delegationState
+              $ Shelley.esLState $ Shelley.nesEs $ Consensus.shelleyLedgerState lState
+
 -- We only compute 'AdaPots' for later eras. This is a time consuming
 -- function and we only want to run it on epoch boundaries.
 getAdaPots :: CardanoLedgerState -> Maybe Generic.AdaPots
@@ -582,14 +594,18 @@ getAdaPots st =
       LedgerStateShelley sts -> Just $ totalAdaPots sts
       LedgerStateAllegra sta -> Just $ totalAdaPots sta
       LedgerStateMary stm -> Just $ totalAdaPots stm
+      LedgerStateAlonzo sta -> Just $ totalAdaPots sta
 
 ledgerEpochNo :: LedgerEnv -> CardanoLedgerState -> EpochNo
 ledgerEpochNo env cls =
     case ledgerTipSlot (ledgerState (clsState cls)) of
       Origin -> 0 -- An empty chain is in epoch 0
-      NotOrigin slot -> runIdentity $ epochInfoEpoch epochInfo slot
+      NotOrigin slot ->
+        case runExcept $ epochInfoEpoch epochInfo slot of
+          Left err -> panic $ "ledgerEpochNo: " <> textShow err
+          Right en -> en
   where
-    epochInfo :: EpochInfo Identity
+    epochInfo :: EpochInfo (Except Consensus.PastHorizonException)
     epochInfo = epochInfoLedger (configLedger $ topLevelConfig env) (hardForkLedgerStatePerEra . ledgerState $ clsState cls)
 
 -- Like 'Consensus.tickThenReapply' but also checks that the previous hash from the block matches
